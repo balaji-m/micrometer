@@ -1,0 +1,1639 @@
+package com.alcon.acemcc.service.impl;
+
+import static com.alcon.acemcc.utils.SchedulerServiceConstants.OPERATION_ROOM_SURGERY_MIN_DURATION;
+import static com.alcon.acemcc.utils.BaseConstants.AUTOSCHEDULE_RESPONSE_CACHE_NAME;
+import static com.alcon.acemcc.utils.SchedulerServiceConstants.SS_DATE_PATTERN;
+import static java.util.stream.Collectors.groupingBy;
+import static java.util.stream.Collectors.mapping;
+import static java.util.stream.Collectors.toSet;
+
+import com.alcon.acemcc.dto.AutoScheduleSurgeryDTO;
+import com.alcon.acemcc.dto.AutoSchedulerSummaryResponseDTO;
+import com.alcon.acemcc.dto.AutoSchedulerSurgeryDetailDTO;
+import com.alcon.acemcc.dto.AutoSchedulerSurgeryUpdateResponseDTO;
+import com.alcon.acemcc.dto.FailedToScheduleSurgeries;
+import com.alcon.acemcc.dto.GraphQLSurgeryDTO;
+import com.alcon.acemcc.dto.GraphQLSurgeryDTO.OperationRoom;
+import com.alcon.acemcc.dto.GraphQLSurgeryDTO.ProcedureRoom;
+import com.alcon.acemcc.dto.GraphQLSurgeryDTO.Surgery;
+import com.alcon.acemcc.dto.GraphqlSurgeryDetailsDTO;
+import com.alcon.acemcc.dto.PatientBreakDTO;
+import com.alcon.acemcc.dto.RoomListingDTO;
+import com.alcon.acemcc.dto.ScheduleShadowCardDTO;
+import com.alcon.acemcc.dto.SurgeonLensPreferenceDTO;
+import com.alcon.acemcc.dto.SurgeonPreferenceDetailsDTO;
+import com.alcon.acemcc.dto.SurgeryBreaksDTO;
+import com.alcon.acemcc.dto.SurgeryBreaksDTO.SurgeryBreak;
+import com.alcon.acemcc.dto.SurgeryRoomDetailsDTO;
+import com.alcon.acemcc.dto.TimeSlot;
+import com.alcon.acemcc.entity.Room;
+import com.alcon.acemcc.entity.RoomTypeMaster.RoomType;
+import com.alcon.acemcc.entity.Schedule;
+import com.alcon.acemcc.entity.Surgeon;
+import com.alcon.acemcc.entity.SurgeonPreference;
+import com.alcon.acemcc.exception.MCCServiceException;
+import com.alcon.acemcc.graphql.mapper.GraphQlSurgeonPreferenceMapper;
+import com.alcon.acemcc.graphql.models.dto.GraphQLRequest;
+import com.alcon.acemcc.graphql.models.dto.GraphQLResponse;
+import com.alcon.acemcc.graphql.service.ClinicConnectRepoService;
+import com.alcon.acemcc.graphql.service.GraphQLClientService;
+import com.alcon.acemcc.mapper.RoomMapper;
+import com.alcon.acemcc.mapper.SurgeonPreferenceMapper;
+import com.alcon.acemcc.repository.RoomRepository;
+import com.alcon.acemcc.repository.ScheduleRepository;
+import com.alcon.acemcc.repository.SurgeonRepository;
+import com.alcon.acemcc.service.AutoSchedulerService;
+import com.alcon.acemcc.service.ScheduleShadowService;
+import com.alcon.acemcc.utils.BaseConstants;
+import com.alcon.acemcc.utils.DateUtil;
+import com.alcon.acemcc.utils.LogUtils;
+import com.alcon.acemcc.utils.SchedulerServiceConstants;
+import com.alcon.acemcc.utils.SchedulerUtils;
+import com.alcon.acemcc.utils.SmartSolutionLensApiAdapter;
+import com.alcon.acemcc.utils.SmartSolutionSurgeryApiAdapter;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.base.Strings;
+import jakarta.servlet.http.HttpServletRequest;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import lombok.AllArgsConstructor;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.Nullable;
+
+@Service
+@AllArgsConstructor
+public class AutoSchedulerServiceImpl implements AutoSchedulerService {
+
+  private final GraphQLClientService graphQLClient;
+
+  private final ScheduleRepository scheduleRepository;
+
+  private final RoomRepository roomRepository;
+
+  private final SurgeonRepository surgeonRepository;
+
+  private final RoomMapper roomMapper;
+
+  private final SurgeonPreferenceMapper surgeonPreferenceMapper;
+
+  private final SmartSolutionLensApiAdapter smartSolutionLensApiAdapter;
+
+  private final SchedulerUtils schedulerUtils;
+  private final HttpServletRequest httpServletRequest;
+  private final ClinicConnectRepoService clinicConnectRepoService;
+  private final GraphQlSurgeonPreferenceMapper graphQLSurgeonPreferenceMapper;
+
+  private final SmartSolutionSurgeryApiAdapter smartSolutionSurgeryApiAdapter;
+
+  private final CacheManager cacheManager;
+
+  private final ScheduleShadowService scheduleShadowService;
+
+  private static class ScheduleSetup {
+
+    Map<String, List<TimeSlot>> surgeonOccupiedSlots;
+
+    Map<String, List<TimeSlot>> otherSurgeonOccupiedSlotsByRoom;
+
+    Map<String, SurgeonPreferenceDetailsDTO> surgeonPreferences;
+    List<RoomListingDTO> operationRooms;
+    RoomListingDTO procedureRoom;
+
+    //surgery breaks
+    List<TimeSlot> surgeonBreaks;
+
+    List<GraphQLSurgeryDTO> userScheduledSurgeries;
+
+
+    List<GraphQLSurgeryDTO> surgeries;
+
+    Map<String, List<TimeSlot>> roomOccupiedSlots;
+
+    LocalDate scheduleDate;
+
+    LocalTime scheduleStartTime;
+
+    boolean scheduleOverride;
+
+    List<TimeSlot> shadowCardDTOList;
+
+
+    public ScheduleSetup() {
+      surgeonOccupiedSlots = new HashMap<>();
+      surgeonPreferences = new HashMap<>();
+      operationRooms = new ArrayList<>();
+      surgeonBreaks = new ArrayList<>();
+      surgeries = new ArrayList<>();
+      roomOccupiedSlots = new HashMap<>();
+      userScheduledSurgeries = new ArrayList<>();
+      shadowCardDTOList = new ArrayList<>();
+    }
+
+    int durationByComplexity(String complexity, String surgeonId) {
+      SurgeonPreferenceDetailsDTO preferenceDetailsDTO = surgeonPreferences.get(surgeonId);
+      int duration = 0;
+      if ((BaseConstants.SURGERY_COMPLEXITY_COMPLEX).equalsIgnoreCase(complexity)) {
+        duration = preferenceDetailsDTO.getComplexSurgeryTime();
+      } else {
+        duration = preferenceDetailsDTO.getStandardSurgeryTime();
+      }
+      return Math.max(duration, OPERATION_ROOM_SURGERY_MIN_DURATION);
+    }
+
+    int getSurgeryDuration(Surgery surgery) {
+      int duration = 0;
+      if (surgery.getOperationRoom() != null
+          && surgery.getOperationRoom().getPlannedDuration() != null) {
+        duration = surgery.getOperationRoom().getPlannedDuration();
+      } else {
+        duration = durationByComplexity(surgery.getComplexity(), surgery.getSurgeonId());
+      }
+      return Math.max(duration, OPERATION_ROOM_SURGERY_MIN_DURATION);
+    }
+
+    String operationRoomIdsAsString() {
+      if (CollectionUtils.isNotEmpty(this.operationRooms)) {
+        return this.operationRooms.stream().map(room -> room.getId().toString())
+            .collect(Collectors.joining(","));
+      }
+      return null;
+    }
+
+    Set<String> getOperationRoomIds() {
+      if (CollectionUtils.isNotEmpty(this.operationRooms)) {
+        return this.operationRooms.stream().map(room -> room.getId().toString())
+            .collect(Collectors.toSet());
+      }
+      return Collections.emptySet();
+    }
+  }
+
+
+  /**
+   * api service method to auto schedule the surgeries.
+   *
+   * @param practiceOrg            - ascId
+   * @param scheduleId             - scheduleId
+   * @param autoScheduleSurgeryDTO - schedulePreferencesDTO
+   * @return AutoSchedulerSummaryResponseDTO - autoSchedulerResponse
+   */
+  @Override
+  public AutoSchedulerSummaryResponseDTO autoSchedule(String practiceOrg, String scheduleId,
+      AutoScheduleSurgeryDTO autoScheduleSurgeryDTO) throws JsonProcessingException {
+
+    boolean applyChanges = autoScheduleSurgeryDTO.isApplyChanges();
+    AutoSchedulerSummaryResponseDTO response = null;
+
+    ScheduleSetup scheduleSetup = new ScheduleSetup();
+    LogUtils.info(
+        "Service layer: request received for auto schedule | practiceOrg: {} | scheduleId: {} | schedulePreferences: {} |",
+        practiceOrg, scheduleId,
+        autoScheduleSurgeryDTO.getSchedulerPreferencesDetailsDTO().toString());
+
+    List<String> operationRoomIds = autoScheduleSurgeryDTO.getSchedulerPreferencesDetailsDTO()
+        .getOperationRoomIds();
+    String procedureRoomId = autoScheduleSurgeryDTO.getSchedulerPreferencesDetailsDTO()
+        .getProcedureRoomId();
+
+    boolean override = autoScheduleSurgeryDTO.getSchedulerPreferencesDetailsDTO().isOverride();
+
+    // to fetch the schedule details from schedule table
+    LogUtils.info("Fetching schedule details from db for the scheduleId: {}", scheduleId);
+    Schedule schedule = scheduleRepository.findById(UUID.fromString(scheduleId)).orElse(null);
+
+    if (schedule != null) {
+      LogUtils.info("Schedule found for the id: {}", scheduleId);
+
+      checkRooms(scheduleSetup, operationRoomIds, procedureRoomId);
+      // If applyChanges is true, check for schedule response in cache and save in SmartSolutions all success surgeries
+      if (applyChanges) {
+        response = applyChanges(response, true, schedule, scheduleSetup, override);
+        // If it was saved - return response
+        // Otherwise - continue run algorithm. It may happen that cache is null, and we need to rerun algorithm
+        if (response != null) {
+          return response;
+        }
+      }
+      response = new AutoSchedulerSummaryResponseDTO();
+    } else {
+      throw new MCCServiceException(HttpStatus.NOT_FOUND,
+          "Schedule not found for the scheduleId: " + scheduleId);
+    }
+
+    // from schedule get the surgeon id and scheduleDate
+    String surgeonId = schedule.getSurgeon().getId().toString();
+    scheduleSetup.scheduleDate = schedule.getDate();
+
+    // to fetch surgeon preferences from db
+    LogUtils.info("Fetching Surgeon details from db for id: {}", surgeonId);
+    Optional<Surgeon> surgeonOptional = surgeonRepository.findById(UUID.fromString(surgeonId));
+
+    if (!CollectionUtils.isEmpty(scheduleSetup.operationRooms)) {
+      if (surgeonOptional.isPresent()) {
+        // to create surgeon preference Map<SurgeonId, SurgeonPreferenceDetailsDTO>
+        Surgeon surgeon = surgeonOptional.get();
+        SurgeonPreference surgeonPreference = surgeon.getPreference();
+        if (surgeonPreference == null) {
+          throw new MCCServiceException(HttpStatus.NOT_FOUND, "surgeonPreference is null or empty");
+        }
+        SurgeonPreferenceDetailsDTO surgeonPreferenceDetailsDTO = surgeonPreferenceMapper.entityToDTO(
+            surgeonPreference);
+        // Get surgeons breaks
+        scheduleSetup.surgeonBreaks = autoScheduleSurgeryDTO.surgeonBreaks();
+        // construct Map<SurgeonId, SurgeonPreferenceDTO>
+        scheduleSetup.surgeonPreferences = Map.of(surgeon.getId().toString(),
+            surgeonPreferenceDetailsDTO);
+
+        //getting query attribute based on selected practice org which is clinic or asc.
+        String queryAttributeName = schedulerUtils.getPracticeOrgAttributeName(httpServletRequest);
+
+        //get all the surgeries using schedule date, (surgeonId or operationRoomIds), practiceOrg, status not in completed, cancel
+        String graphQLQuerySurgeryList = String.format(
+            SchedulerServiceConstants.GQL_AUTO_SCHEDULE_SURGERIES,
+            scheduleSetup.scheduleDate, surgeon.getId(), scheduleSetup.operationRoomIdsAsString(),
+            queryAttributeName,
+            practiceOrg);
+
+        // get surgeries to autoSchedule.
+        GraphqlSurgeryDetailsDTO autoSchedulerAlgorithmSurgeryResponseDTO = fetchSurgeryListForAutoSchedulerAlgorithm(
+            practiceOrg, graphQLQuerySurgeryList);
+
+        // graphql response surgeries result set.
+        List<GraphQLSurgeryDTO> surgeriesList = autoSchedulerAlgorithmSurgeryResponseDTO.getSurgeryResponse()
+            .getSurgeries();
+
+        LogUtils.info("SS Response {} surgeries to autoSchedule", surgeriesList.size());
+
+        if (!CollectionUtils.isEmpty(surgeriesList)) {
+
+          //update surgeonId and name
+          setSurgeonForSurgeries(surgeriesList);
+
+          // filter current surgeon surgeries and surgeries to be scheduled.
+          List<GraphQLSurgeryDTO> surgeryToBeScheduled = surgeryToBeScheduled(
+              surgeonId, surgeriesList, override);
+
+          scheduleSetup.userScheduledSurgeries = userScheduledSurgeries(surgeonId, surgeriesList);
+          //computing and setting iol surgeon preferences in surgery DTO
+          surgeryToBeScheduled.stream().forEach(surgery -> {
+            surgery.setIolSurgeonPreferences(smartSolutionLensApiAdapter.computeIolPreferences(
+                List.of(surgery.getSurgeryData().getIols()),
+                graphQLSurgeonPreferenceMapper.entityToDto(surgeon.getPreference()),
+                surgery.getSurgeryData().isOra(),
+                BooleanUtils.isTrue(surgery.getSurgeryData().isIncludeSecondPrimary())));
+
+          });
+
+          // Sort surgeries based on priority score (higher score first)
+          scheduleSetup.surgeries = surgeryToBeScheduled.stream()
+              .map(surgery -> surgery.calculatePriorities(
+                  autoScheduleSurgeryDTO.getSchedulerPreferencesDetailsDTO()
+                      .getPrioritizationCriteria()))
+              .sorted(Comparator.comparingInt(GraphQLSurgeryDTO::getPriorityScore)
+                  .reversed())
+              .toList();
+
+          // TODO: check for view by time.
+          // get roomwise occupied slots
+          List<GraphQLSurgeryDTO> occupiedSlots = getOccupiedSurgerySlots(surgeonId, surgeriesList,
+              override);
+
+          // grouping and get room wise occupied slots
+          scheduleSetup.roomOccupiedSlots = roomOccupiedSlots(occupiedSlots);
+
+          //grouping and get surgeon wise occupied slots
+          scheduleSetup.surgeonOccupiedSlots = surgeonOccupiedSlots(occupiedSlots);
+
+          scheduleSetup.otherSurgeonOccupiedSlotsByRoom = otherSurgeonOccupiedSlotsByRoom(surgeonId,
+              occupiedSlots);
+
+          scheduleSetup.scheduleStartTime = autoScheduleSurgeryDTO.startTime();
+
+          // setting override status.
+          scheduleSetup.scheduleOverride = override;
+
+          //fetch shadow cards
+          fetchShadowCards(scheduleId, scheduleSetup);
+
+          response = schedule(scheduleId, scheduleSetup); // call schedule.
+
+          LogUtils.info("Adding break by patient for the scheduleId: {}", scheduleId);
+          addBreakByPatient(scheduleId, scheduleSetup, autoScheduleSurgeryDTO,
+              response); // add Break by patient
+          applyChanges(response, applyChanges, schedule, scheduleSetup, override);
+        } else {
+          LogUtils.error("No surgeries found to auto schedule");
+        }
+      } else {
+        throw new MCCServiceException(HttpStatus.NOT_FOUND, "Surgeon not found: " + surgeonId);
+      }
+    }
+    return response;
+  }
+
+  private void setSurgeonForSurgeries(List<GraphQLSurgeryDTO> surgeriesList) {
+    surgeriesList.forEach(e -> {
+      String surgeonId = e.getSurgeryData().getSurgeonId();
+      GraphQLSurgeryDTO.Surgeon surgeonDTO = new GraphQLSurgeryDTO.Surgeon();
+      surgeonDTO.setId(surgeonId);
+      surgeonDTO.setFirstName(
+          clinicConnectRepoService.getSurgeonById(UUID.fromString(surgeonId)).getFirstName());
+      e.setSurgeon(surgeonDTO);
+      e.setSurgeonId(surgeonId);
+      e.setSurgeryId(e.getSurgeryData().getSurgeryId());
+    });
+  }
+
+
+  /**
+   * method to add surgery breaks by patient
+   *
+   * @param scheduleId             - scheduleId
+   * @param scheduleSetup          - scheduleSetup
+   * @param autoScheduleSurgeryDTO - schedulePreferencesDTO
+   * @param summaryResponseDTO     - autoSchedulerResponse
+   */
+  private void addBreakByPatient(String scheduleId, ScheduleSetup scheduleSetup,
+      AutoScheduleSurgeryDTO autoScheduleSurgeryDTO,
+      AutoSchedulerSummaryResponseDTO summaryResponseDTO) {
+
+    //override is true get all the autoscheduled surgeries
+    // override is false fetch all the manually scheduled surgeries + auto scheduled surgeries
+
+    //hold all the surgery. user scheduled + auto scheduled
+    List<GraphQLSurgeryDTO> combinedScheduledSurgeryList = new ArrayList<>();
+
+    List<TimeSlot> patientBreakDTOList = new ArrayList<>();
+
+    //get break from preferences
+    List<SurgeryBreaksDTO> surgeryBreakList = autoScheduleSurgeryDTO.getSchedulerPreferencesDetailsDTO()
+        .getSurgeryBreaks();
+
+    //filter only patient break from surgery breaks
+    List<SurgeryBreaksDTO> surgeryBreakListByPatient = surgeryBreakList.stream()
+        .filter(e -> e.getType().equals(SurgeryBreak.patient.name())).toList();
+
+    LogUtils.info(
+        "Schedule preference details - surgery break - breakByPatient config size: {} for the scheduleId: {}",
+        surgeryBreakListByPatient.size(), scheduleId);
+
+    // break by patient exists
+    if (!CollectionUtils.isEmpty(surgeryBreakListByPatient)) {
+
+      LogUtils.info("breakByPatient config exists");
+
+      //get all the auto scheduled surgery scheduled by algorithm
+      List<GraphQLSurgeryDTO> autoScheduledSurgeryList = summaryResponseDTO.getScheduledSurgeries();
+
+      // get all the user scheduled surgery using scheduler application
+      List<GraphQLSurgeryDTO> userScheduledSurgeryList = scheduleSetup.userScheduledSurgeries;
+      LogUtils.info("Break by patient user scheduled surgery list size: {}",
+          userScheduledSurgeryList.size());
+      LogUtils.info("Break by patient auto scheduled surgery list size: {}",
+          autoScheduledSurgeryList.size());
+
+      if (scheduleSetup.scheduleOverride) {
+        // all the surgeries are auto scheduled if override is true.
+        combinedScheduledSurgeryList.addAll(autoScheduledSurgeryList);
+      } else {
+        // set as scheduled. for the surgery already scheduled by the application.
+        userScheduledSurgeryList.forEach(e -> e.setUserScheduled(true));
+        combinedScheduledSurgeryList.addAll(userScheduledSurgeryList);
+        combinedScheduledSurgeryList.addAll(autoScheduledSurgeryList);
+      }
+
+      SurgeryBreaksDTO surgeryBreaksDTO = surgeryBreakListByPatient.get(0);
+
+      // adding break after n surgery.
+      List<GraphQLSurgeryDTO> allSurgeryListWithAddedBreak = addBreakAfterEveryNPatients(
+          scheduleId,
+          scheduleSetup, combinedScheduledSurgeryList,
+          surgeryBreaksDTO,
+          patientBreakDTOList, summaryResponseDTO);
+
+      // filter only the auto scheduled surgeries and set in response object
+      List<GraphQLSurgeryDTO> autoScheduledList = allSurgeryListWithAddedBreak.stream()
+          .filter(e -> !e.isUserScheduled()).toList();
+      // set to response object
+      summaryResponseDTO.setScheduledSurgeries(autoScheduledList);
+      List<PatientBreakDTO> patientBreakDTOS = patientBreakDTOList.stream()
+          .map(e -> new PatientBreakDTO(e.getStart().toString(), e.getEnd().toString())).toList();
+      // set patient break list
+      summaryResponseDTO.setPatientBreakDTOList(patientBreakDTOS);
+    }
+
+  }
+
+  /**
+   * method to include surgery breaks by every n patient
+   *
+   * @param scheduleId          - scheduleId
+   * @param scheduleSetup       - scheduleSetup
+   * @param surgeryList         - surgeryList
+   * @param surgeryBreaksDTO    - surgeryBreaksDTO
+   * @param patientBreakDTOList - patientBreakList
+   * @param summaryResponseDTO  - autoSchedulerResponse
+   * @return List<GraphQLSurgeryDTO> - surgery list with breaks added.
+   */
+  private List<GraphQLSurgeryDTO> addBreakAfterEveryNPatients(String scheduleId,
+      ScheduleSetup scheduleSetup,
+      List<GraphQLSurgeryDTO> surgeryList, SurgeryBreaksDTO surgeryBreaksDTO,
+      List<TimeSlot> patientBreakDTOList, AutoSchedulerSummaryResponseDTO summaryResponseDTO) {
+
+    // Sort surgeries by start time
+    DateTimeFormatter formatter = DateTimeFormatter.ofPattern(SS_DATE_PATTERN);
+    surgeryList.sort(Comparator.comparing(
+        s -> LocalDateTime.parse(s.getSurgeryData().getOperationRoom().getStartTime(), formatter)));
+
+    List<GraphQLSurgeryDTO> adjusted = new ArrayList<>(); // result list
+
+    // add sugeries which exceeds end of the day
+    List<GraphQLSurgeryDTO> noSlotAvailableSurgeryList = new ArrayList<>();
+
+    int counter = 0; // Count surgeries since last break
+
+    for (GraphQLSurgeryDTO graphQLSurgeryDTO : surgeryList) {
+
+      boolean hasProcedureRoom = false;
+
+      LocalDateTime currentStartTime = LocalDateTime.parse(
+          graphQLSurgeryDTO.getSurgeryData().getOperationRoom().getStartTime(), formatter);
+
+      if (graphQLSurgeryDTO.getSurgeryData().getProcedureRoom() != null && !Strings.isNullOrEmpty(
+          graphQLSurgeryDTO.getSurgeryData().getProcedureRoom().getRoomId())) {
+        hasProcedureRoom = true;
+        currentStartTime = LocalDateTime.parse(
+            graphQLSurgeryDTO.getSurgeryData().getProcedureRoom().getStartTime(), formatter);
+      }
+
+      // If there are previous surgeries, adjust the current start time
+      if (!adjusted.isEmpty()) {
+        GraphQLSurgeryDTO previous = adjusted.get(adjusted.size() - 1);
+
+        //to get the previous endtime
+        LocalDateTime previousStartTime = LocalDateTime.parse(
+            previous.getSurgeryData().getOperationRoom().getStartTime(), formatter);
+
+        // last operation room end time
+        LocalDateTime previousEndTime = previousStartTime.plusMinutes(
+            previous.getSurgeryData().getOperationRoom().getPlannedDuration());
+
+        // Ensure the current surgery starts after the previous one ends
+        if (currentStartTime.isBefore(previousEndTime)) {
+          if (hasProcedureRoom) {
+            updateOperationAndProcedureRoomTime(scheduleSetup, graphQLSurgeryDTO, previousEndTime,
+                noSlotAvailableSurgeryList, patientBreakDTOList);
+
+          } else {
+            updateOperationRoomTime(scheduleSetup, previousEndTime, graphQLSurgeryDTO,
+                noSlotAvailableSurgeryList, patientBreakDTOList);
+          }
+        }
+
+        // Add a break after every n surgeries
+        counter++;
+        if (counter == surgeryBreaksDTO.getNumberOfPatients()) {  // wait until n completes
+          LocalTime nthCompletionTime = LocalTime.of(previousEndTime.getHour(),
+              previousEndTime.getMinute());  // nth surgery completion time.
+
+          // adding break duration to the nth completion time.
+          TimeSlot calculatedPatientBreak = new TimeSlot(nthCompletionTime,
+              nthCompletionTime.plusMinutes(surgeryBreaksDTO.getDuration()));
+
+          // to check surgery break by patient conflict with surgery break by time if it is, adjust the break time.
+          calculatedPatientBreak = resolveTimeBreakPatientBreakOverlaps(scheduleId, scheduleSetup,
+              calculatedPatientBreak);
+
+          // to check surgery break by patient conflict with user scheduled surgeries if it is, adjust the break time.
+          TimeSlot adjustedBreakTime = resolveUserScheduledSurgeryPatientBreakOverlaps(scheduleId,
+              scheduleSetup,
+              calculatedPatientBreak);
+
+          if (adjustedBreakTime != null) {
+            // calculate break duration in minutes.
+            patientBreakDTOList.add(adjustedBreakTime);
+            LocalTime calculatedPatientBreakEndTime = adjustedBreakTime.getEnd();
+
+            // construct date time object
+            LocalDateTime calculatedPatientBreakEndDateTime = LocalDateTime.of(
+                scheduleSetup.scheduleDate, LocalTime.of(calculatedPatientBreakEndTime.getHour(),
+                    calculatedPatientBreakEndTime.getMinute()));
+
+            // if the current surgery time is before the break end time adjust the current surgery start time.
+            if (currentStartTime.isBefore(calculatedPatientBreakEndDateTime)) {
+              if (hasProcedureRoom) {
+                updateOperationAndProcedureRoomTime(scheduleSetup, graphQLSurgeryDTO,
+                    calculatedPatientBreakEndDateTime, noSlotAvailableSurgeryList,
+                    patientBreakDTOList);
+              } else {
+                updateOperationRoomTime(scheduleSetup, calculatedPatientBreakEndDateTime,
+                    graphQLSurgeryDTO,
+                    noSlotAvailableSurgeryList, patientBreakDTOList);
+              }
+            }
+
+          }
+          counter = 0; // Reset the counter
+        }
+      }
+      List<String> noSlotAvailableSurgeries = noSlotAvailableSurgeryList.stream()
+          .map(e -> e.getSurgeryData().getSurgeryId()).toList();
+      if (!noSlotAvailableSurgeries.contains(graphQLSurgeryDTO.getSurgeryData().getSurgeryId())) {
+        adjusted.add(graphQLSurgeryDTO);  // add the first surgery
+      }
+    }
+    // after adding breaks if no timeslot available
+    noSlotAvailableSurgeryList.forEach(summaryResponseDTO::addNoTimeSlot);
+    return adjusted;
+  }
+
+  /**
+   * method to update the operationRoomTime with surgery break
+   *
+   * @param scheduleSetup              - scheduleSetup
+   * @param previousEndTime            - previousEndTime
+   * @param current                    - currentSurgery
+   * @param noSlotAvailableSurgeryList - noSlotAvailableSurgeryList
+   */
+  private void updateOperationRoomTime(ScheduleSetup scheduleSetup, LocalDateTime previousEndTime,
+      GraphQLSurgeryDTO current,
+      List<GraphQLSurgeryDTO> noSlotAvailableSurgeryList, List<TimeSlot> patientBreakDTOList) {
+    LocalDateTime newStartTime = resolveTimeOverlaps(previousEndTime,
+        current.getSurgeryData().getOperationRoom().getPlannedDuration(), current, scheduleSetup,
+        patientBreakDTOList);
+
+    //calculate operation room end time
+    LocalDateTime operationRoomEndTime = newStartTime.plusMinutes(
+        current.getSurgeryData().getOperationRoom().getPlannedDuration());
+
+    // calculate end of working day
+    LocalDateTime endOfWorkingDay = endOfWorkingDay(current);
+
+    //check new start time is before EOD
+    if (operationRoomEndTime.isBefore(endOfWorkingDay)) {
+      current.getSurgeryData().getOperationRoom()
+          .setStartTime(DateUtil.localDateTimeToString(newStartTime, SS_DATE_PATTERN));
+    } else {
+      Optional<GraphQLSurgeryDTO> isCurrentSurgeryInNoSlotAvailableList = noSlotAvailableSurgeryList.stream()
+          .filter(e -> e.getSurgeryData().getSurgeryId()
+              .equals(current.getSurgeryData().getSurgeryId())).findAny();
+      if (isCurrentSurgeryInNoSlotAvailableList.isEmpty()) {
+        noSlotAvailableSurgeryList.add(current);
+      }
+    }
+
+  }
+
+  private LocalDateTime endOfWorkingDay(GraphQLSurgeryDTO current) {
+    DateTimeFormatter formatter = DateTimeFormatter.ofPattern(SS_DATE_PATTERN);
+    LocalDateTime endOfWorkingDay = LocalDateTime.parse(
+        current.getSurgeryData().getOperationRoom().getStartTime(), formatter);
+    endOfWorkingDay = endOfWorkingDay.withHour(23).withMinute(59).withSecond(59);
+    return endOfWorkingDay;
+  }
+
+
+  /**
+   * method to update the operationRoomTime and procedureRoomTime with surgery break
+   *
+   * @param scheduleSetup              - scheduleSetup
+   * @param current                    - currentSurgery
+   * @param previousEndTime            - previousEndTime
+   * @param noSlotAvailableSurgeryList - noSlotAvailableSurgeryList
+   */
+  private void updateOperationAndProcedureRoomTime(ScheduleSetup scheduleSetup,
+      GraphQLSurgeryDTO current,
+      LocalDateTime previousEndTime,
+      List<GraphQLSurgeryDTO> noSlotAvailableSurgeryList, List<TimeSlot> patientBreakDTOList) {
+
+    // total duration of procedure room and op room.
+    int totalDuration = current.getSurgeryData().getProcedureRoom().getPlannedDuration() +
+        current.getSurgeryData().getOperationRoom().getPlannedDuration();
+    LocalDateTime newStartTime = resolveTimeOverlaps(previousEndTime,
+        totalDuration, current, scheduleSetup, patientBreakDTOList);
+
+    //calculate procedure room end time
+    LocalDateTime procedureRoomEndTime = newStartTime.plusMinutes(
+        current.getSurgeryData().getProcedureRoom().getPlannedDuration());
+
+    //calculate operation room end time
+    LocalDateTime operationRoomEndTime = procedureRoomEndTime.plusMinutes(
+        current.getSurgeryData().getOperationRoom().getPlannedDuration());
+
+    // calculate end of working day
+    LocalDateTime endOfWorkingDay = endOfWorkingDay(current);
+
+    //check new start time is before EOD
+    if (operationRoomEndTime.isBefore(endOfWorkingDay)) {
+
+      // set procedure room start time
+      current.getSurgeryData().getProcedureRoom()
+          .setStartTime(DateUtil.localDateTimeToString(newStartTime, SS_DATE_PATTERN));
+
+      // set operation room start time
+      current.getSurgeryData().getOperationRoom()
+          .setStartTime(DateUtil.localDateTimeToString(procedureRoomEndTime, SS_DATE_PATTERN));
+
+    } else {
+      Optional<GraphQLSurgeryDTO> isCurrentSurgeryInNoSlotAvailableList = noSlotAvailableSurgeryList.stream()
+          .filter(e -> e.getSurgeryData().getSurgeryId()
+              .equals(current.getSurgeryData().getSurgeryId())).findAny();
+      if (isCurrentSurgeryInNoSlotAvailableList.isEmpty()) {
+        noSlotAvailableSurgeryList.add(current);
+      }
+    }
+  }
+
+  /**
+   * method to resolve time overlaps if any surgery break by time or scheduled surgeries
+   *
+   * @param adjustedStartDateTime - adjustedStartDateTime
+   * @param duration              - duration
+   * @param scheduleSetup         - scheduleSetup
+   * @return LocalDateTime - resolvedTime
+   */
+
+  private LocalDateTime resolveTimeOverlaps(LocalDateTime adjustedStartDateTime,
+      int duration, GraphQLSurgeryDTO current, ScheduleSetup scheduleSetup,
+      List<TimeSlot> patientBreakDTOList) {
+    LocalTime adjustedSurgeryStartTime = LocalTime.of(adjustedStartDateTime.getHour(),
+        adjustedStartDateTime.getMinute());
+    LocalTime adjustedSurgeryEndTime = adjustedSurgeryStartTime.plusMinutes(duration);
+    LocalTime nextAvailableStartTime = adjustedSurgeryStartTime;
+    TimeSlot newTimeSlot = new TimeSlot(adjustedSurgeryStartTime, adjustedSurgeryEndTime);
+
+    List<TimeSlot> existingOccupiedTimeSlots = getUserScheduledSurgeryAsTimeSlot(
+        scheduleSetup);
+
+    // to check if the room is occupied by other surgeon during that time
+    String currentSurgeryRoomId = current.getSurgeryData().getOperationRoom().getRoomId();
+    if (!scheduleSetup.otherSurgeonOccupiedSlotsByRoom.isEmpty()) {
+      List<TimeSlot> otherSurgeonTimeSlots = scheduleSetup.otherSurgeonOccupiedSlotsByRoom.get(
+          currentSurgeryRoomId);
+      if (!CollectionUtils.isEmpty(otherSurgeonTimeSlots)) {
+        existingOccupiedTimeSlots.addAll(otherSurgeonTimeSlots);
+      }
+    }
+
+    while (true) {
+
+      // checking any overlap with break time
+      boolean overlapWithSurgeonBreaks = scheduleSetup.surgeonBreaks.stream()
+          .anyMatch(newTimeSlot::overlapsWith);
+
+      // checking any overlap with scheduled surgeries
+      boolean overlapWithExistingOccupiedTimeslotSurgeries = existingOccupiedTimeSlots.stream()
+          .anyMatch(newTimeSlot::overlapsWith);
+
+      // checking overlap by number of patients break
+      boolean overlapWithNPatientBreak = patientBreakDTOList.stream()
+          .anyMatch(newTimeSlot::overlapsWith);
+
+      // checking overlap with shadow cards
+      boolean overlapWithShadowCards = scheduleSetup.shadowCardDTOList.stream().anyMatch(newTimeSlot::overlapsWith);
+
+      if (!overlapWithSurgeonBreaks && !overlapWithExistingOccupiedTimeslotSurgeries
+          && !overlapWithNPatientBreak && !overlapWithShadowCards) {
+        return LocalDateTime.of(
+            scheduleSetup.scheduleDate, LocalTime.of(nextAvailableStartTime.getHour(),
+                nextAvailableStartTime.getMinute()));
+      }
+
+      // find the latest time among overlapping slots.
+      Optional<LocalTime> latestOverlapSlotEndTime =  Stream.of(Stream.concat(
+          scheduleSetup.surgeonBreaks.stream()
+              .filter(newTimeSlot::overlapsWith)
+              .map(TimeSlot::getEnd),
+          existingOccupiedTimeSlots.stream()
+              .filter(newTimeSlot::overlapsWith)
+              .map(TimeSlot::getEnd)),
+          patientBreakDTOList.stream()
+              .filter(newTimeSlot::overlapsWith)
+              .map(TimeSlot::getEnd),
+          scheduleSetup.shadowCardDTOList.stream()
+              .filter(newTimeSlot::overlapsWith)
+              .map(TimeSlot::getEnd)
+          ).flatMap(s->s).max(Comparator.naturalOrder());
+
+      if (latestOverlapSlotEndTime.isPresent()) {
+        nextAvailableStartTime = latestOverlapSlotEndTime.get();
+        LocalTime nextAvailableEndTime = nextAvailableStartTime.plusMinutes(duration);
+        newTimeSlot = new TimeSlot(nextAvailableStartTime, nextAvailableEndTime);
+      }
+    }
+
+  }
+
+
+  /**
+   * method to resolve if calculated patient break has any overlaps with user scheduled surgeries
+   *
+   * @param scheduleId             - scheduleId
+   * @param scheduleSetup          - scheduleSetup
+   * @param calculatedPatientBreak - calculatedPatientBreak
+   * @return timeslot - resolvedTime
+   */
+
+  private TimeSlot resolveUserScheduledSurgeryPatientBreakOverlaps(String scheduleId,
+      ScheduleSetup scheduleSetup,
+      TimeSlot calculatedPatientBreak) {
+
+    // We should plan 20 minutes break, but we only have 10 minutes of free time slot, then we make 10minutes break
+    //If the overlap is full, and we cannot fit even 5 minutes break we do not make any break.
+
+    // get all the user scheduled surgery.
+    List<TimeSlot> userScheduledSurgeryAsTimeSlot = getUserScheduledSurgeryAsTimeSlot(
+        scheduleSetup);
+    List<TimeSlot> overlapTimeSlots = new ArrayList<>();
+
+    int calculatedBreakDuration = calculatedPatientBreak.getEnd().toSecondOfDay() / 60
+        - calculatedPatientBreak.getStart().toSecondOfDay() / 60;
+
+    // get the all the user scheduled surgeries and check overlap with calculatedPatientBreak
+    if (!CollectionUtils.isEmpty(userScheduledSurgeryAsTimeSlot)) {
+      for (TimeSlot slot : userScheduledSurgeryAsTimeSlot) {
+        if (calculatedPatientBreak.overlapsWith(slot)) {
+          overlapTimeSlots.add(slot);
+        }
+      }
+    }
+
+    LogUtils.info("Schedule id: {} | userScheduledSurgery overlap break size: {}", scheduleId,
+        overlapTimeSlots.size());
+
+    // this overlap size is max 1.
+    if (!CollectionUtils.isEmpty(overlapTimeSlots)) {
+      // get the overlapped surgery time slot.
+      TimeSlot surgerySlot = overlapTimeSlots.get(0);
+
+      // calculate time between surgery start time and break start time.
+      int gapDuration = surgerySlot.getStart().toSecondOfDay() / 60
+          - calculatedPatientBreak.getStart().toSecondOfDay() / 60;
+      // if duration is less than 5 mins. ignore that patient  break.
+      if (gapDuration < 5) {
+        // no breaks needs to be added.
+        return null;
+      } else {
+        // get the minimum of available time and surgery break duration.
+        gapDuration = Math.min(gapDuration, calculatedBreakDuration);
+        // if duration is greater than 5mins revise the break duration to the available time so that user scheduled surgery time should not be changed.
+        calculatedPatientBreak.end = calculatedPatientBreak.getStart().plusMinutes(gapDuration);
+      }
+    }
+    return calculatedPatientBreak;
+  }
+
+
+  /**
+   * method to resolve if calculated patient break has any overlaps with time break
+   *
+   * @param scheduleId             - scheduleId
+   * @param scheduleSetup          - scheduleSetup
+   * @param calculatedPatientBreak - calculatedPatientBreak
+   * @return timeslot - resolvedTime
+   */
+  private static TimeSlot resolveTimeBreakPatientBreakOverlaps(String scheduleId,
+      ScheduleSetup scheduleSetup,
+      TimeSlot calculatedPatientBreak) {
+    List<TimeSlot> overlapTimeSlots = new ArrayList<>();
+
+    // get the all the surgery break by time and check overlap with calculatedPatientBreak
+    for (TimeSlot breakSlot : scheduleSetup.surgeonBreaks) {
+      if (calculatedPatientBreak.overlapsWith(breakSlot)) {
+        overlapTimeSlots.add(breakSlot);
+      }
+    }
+    LogUtils.info("schedule id: {} | overlap surgery break size: {} ", scheduleId,
+        overlapTimeSlots.size());
+
+    if (!CollectionUtils.isEmpty(overlapTimeSlots)) {
+
+      Optional<TimeSlot> minStartTimeOptional = overlapTimeSlots.stream()
+          .min(Comparator.comparing(TimeSlot::getStart)); // get the minimal start time
+      Optional<TimeSlot> maxEndTimeOptional = overlapTimeSlots.stream()
+          .max(Comparator.comparing(TimeSlot::getEnd)); // get the maximum end time
+
+      if (minStartTimeOptional.isPresent()) {
+
+        // calculated patient break duration in minutes.
+        int calculatedPatientBreakDuration =
+            calculatedPatientBreak.getEnd().toSecondOfDay() / 60
+                - calculatedPatientBreak.getStart().toSecondOfDay() / 60;
+
+        //overlapped time surgery break duration in minutes.
+        int surgeryBreakDuration = maxEndTimeOptional.get().getEnd().toSecondOfDay() / 60
+            - minStartTimeOptional.get().getStart().toSecondOfDay() / 60;
+
+        // get the max of two break duration.
+        int maxDuration = Math.max(calculatedPatientBreakDuration, surgeryBreakDuration);
+
+        // take the min break start time
+        LocalTime minBreakStartTime =
+            calculatedPatientBreak.getStart().isBefore(minStartTimeOptional.get().start)
+                ? calculatedPatientBreak.getStart() :
+                minStartTimeOptional.get().start;
+
+        // add the max duration with min break start time
+        LocalTime breakEndTime = minBreakStartTime.plusMinutes(maxDuration);
+        return new TimeSlot(minBreakStartTime, breakEndTime);
+      }
+    }
+    return calculatedPatientBreak;
+  }
+
+  /**
+   * method to fetch user scheduled surgery as timeslot
+   *
+   * @param scheduleSetup - scheduleSetup
+   * @return timeslot - timeSlots
+   */
+  private static List<TimeSlot> getUserScheduledSurgeryAsTimeSlot(ScheduleSetup scheduleSetup) {
+    List<TimeSlot> scheduledSurgeryTimeSlots = new ArrayList<>();
+    //if override is false. return user scheduled surgery.
+    // if override is true return empty.
+    if (!scheduleSetup.scheduleOverride) {
+      scheduleSetup.userScheduledSurgeries.forEach(e -> {
+        OperationRoom operationRoom = e.getSurgeryData().getOperationRoom();
+        if (operationRoom != null && operationRoom.getStartTime() != null) {
+          String surgeryStartTimeValue = operationRoom.getStartTime();
+          LocalTime surgeryStartTime = DateUtil.stringToLocalTime(surgeryStartTimeValue,
+              SS_DATE_PATTERN);
+          LocalTime surgeryEndTime = surgeryStartTime.plusMinutes(
+              operationRoom.getPlannedDuration());
+          scheduledSurgeryTimeSlots.add(new TimeSlot(surgeryStartTime, surgeryEndTime));
+        }
+      });
+    }
+    return scheduledSurgeryTimeSlots;
+  }
+
+
+  /**
+   * method to update surgeries in SmartSolution
+   *
+   * @param scheduledSurgeries        - scheduledSurgeies
+   * @param failedToScheduleSurgeries - failedToScheduleSurgeries
+   * @param override                  - override
+   * @return AutoSchedulerSurgeryUpdateResponseDTO - smartSolutionResponse
+   */
+  private AutoSchedulerSurgeryUpdateResponseDTO updateSurgeriesInSmartSolution(
+      List<GraphQLSurgeryDTO> scheduledSurgeries,
+      FailedToScheduleSurgeries failedToScheduleSurgeries, boolean override) {
+
+    List<AutoSchedulerSurgeryDetailDTO> buildSurgeryUpdateRequest = buildSurgeryUpdateRequest(
+        scheduledSurgeries, failedToScheduleSurgeries, override);
+
+    Map<String, List<AutoSchedulerSurgeryDetailDTO>> mapByPracticeOrg = buildSurgeryUpdateRequest.stream()
+        .collect(groupingBy(AutoSchedulerSurgeryDetailDTO::getPracticeOrg));
+    AutoSchedulerSurgeryUpdateResponseDTO responseDTO = new AutoSchedulerSurgeryUpdateResponseDTO();
+    mapByPracticeOrg.forEach((key, value) -> {
+      AutoSchedulerSurgeryUpdateResponseDTO ssResponse = smartSolutionSurgeryApiAdapter.updateAutoScheduledSurgeries(
+          key, value);
+      responseDTO.addData(ssResponse);
+    });
+    return responseDTO;
+  }
+
+  private List<AutoSchedulerSurgeryDetailDTO> buildSurgeryUpdateRequest(
+      List<GraphQLSurgeryDTO> scheduledSurgeries,
+      FailedToScheduleSurgeries failedToScheduleSurgeries, boolean override) {
+    List<AutoSchedulerSurgeryDetailDTO> surgeryUpdateRequestList = new ArrayList<>();
+
+    //for scheduled surgeries
+    for (GraphQLSurgeryDTO surgery : scheduledSurgeries) {
+      AutoSchedulerSurgeryDetailDTO surgeryDetail = new AutoSchedulerSurgeryDetailDTO();
+
+      surgeryDetail.setSurgeryId(surgery.getSurgeryData().getSurgeryId());
+      surgeryDetail.setPatientId(surgery.getPatient().getPatientId());
+      surgeryDetail.setPracticeOrg(surgery.getSurgeryData().getPracticeOrg());
+      if (Objects.nonNull(surgery.getSurgeryData().getOperationRoom())) {
+        surgeryDetail.setOperationRoom(
+            new SurgeryRoomDetailsDTO(surgery.getSurgeryData().getOperationRoom().getRoomId(),
+                surgery.getSurgeryData().getOperationRoom().getPlannedDuration(),
+                surgery.getSurgeryData().getOperationRoom().getStartTime()));
+      }
+      if (Objects.nonNull(surgery.getSurgeryData().getProcedureRoom())) {
+        surgeryDetail.setProcedureRoom(
+            new SurgeryRoomDetailsDTO(surgery.getSurgeryData().getProcedureRoom().getRoomId(),
+                surgery.getSurgeryData().getProcedureRoom().getPlannedDuration(),
+                surgery.getSurgeryData().getProcedureRoom().getStartTime()));
+      }
+      surgeryUpdateRequestList.add(surgeryDetail);
+    }
+
+    // for failed surgeries if override is true. set RoomId and startTime as null
+    clearScheduleForFailedSurgeries(failedToScheduleSurgeries, override, surgeryUpdateRequestList);
+    return surgeryUpdateRequestList;
+  }
+
+  private void clearScheduleForFailedSurgeries(FailedToScheduleSurgeries failedToScheduleSurgeries,
+      boolean override,
+      List<AutoSchedulerSurgeryDetailDTO> surgeryUpdateRequestList) {
+    if (override) {
+      List<GraphQLSurgeryDTO> surgeryFailToUpdateRequestList = new ArrayList<>();
+      surgeryFailToUpdateRequestList.addAll(failedToScheduleSurgeries.getNoTimeSlot());
+      surgeryFailToUpdateRequestList.addAll(failedToScheduleSurgeries.getNoORARoom());
+      surgeryFailToUpdateRequestList.addAll(failedToScheduleSurgeries.getNoFemtoRoom());
+      if (CollectionUtils.isNotEmpty(surgeryFailToUpdateRequestList)) {
+        surgeryFailToUpdateRequestList.forEach(e -> {
+          AutoSchedulerSurgeryDetailDTO surgeryDetail = new AutoSchedulerSurgeryDetailDTO();
+          surgeryDetail.setSurgeryId(e.getSurgeryData().getSurgeryId());
+          surgeryDetail.setPatientId(e.getPatient().getPatientId());
+          surgeryDetail.setPracticeOrg(e.getSurgeryData().getPracticeOrg());
+          if (Objects.nonNull(e.getSurgeryData().getOperationRoom())) {
+            surgeryDetail.setOperationRoom(
+                new SurgeryRoomDetailsDTO(null,
+                    e.getSurgeryData().getOperationRoom().getPlannedDuration(),
+                    null));
+          }
+          if (Objects.nonNull(e.getSurgeryData().getProcedureRoom())) {
+            surgeryDetail.setProcedureRoom(
+                new SurgeryRoomDetailsDTO(null,
+                    e.getSurgeryData().getProcedureRoom().getPlannedDuration(),
+                    null));
+          }
+          surgeryUpdateRequestList.add(surgeryDetail);
+        });
+      }
+    }
+  }
+
+
+  private GraphqlSurgeryDetailsDTO fetchSurgeryListForAutoSchedulerAlgorithm(
+      String practiceOrg, String graphQLQuery) {
+    // Call SS graphql endpoint to get the surgery object
+    LogUtils.info(
+        "Service layer: Calling the SS Graphql to get surgeryDetails for auto scheduling | practiceOrg: {}",
+        practiceOrg);
+
+    GraphQLRequest graphqlRequest = GraphQLRequest.builder().query(graphQLQuery).build();
+
+    GraphQLResponse<GraphqlSurgeryDetailsDTO> surgeryDetailsResponse = graphQLClient.executeQueryRequest(
+        graphqlRequest, GraphqlSurgeryDetailsDTO.class);
+
+    LogUtils.info(
+        "Service layer: Response received from SS Graphql for auto scheduling | practiceOrg: {}",
+        practiceOrg);
+
+    if (Objects.nonNull(surgeryDetailsResponse)) {
+      return surgeryDetailsResponse.getData();
+    } else {
+      LogUtils.error(
+          "Graphql execute query response object is null for getting surgery details | practiceOrg: {}",
+          practiceOrg);
+      throw new MCCServiceException(HttpStatus.INTERNAL_SERVER_ERROR,
+          SchedulerServiceConstants.SCHEDULER_DOWNSTREAM_API_RESPONSE_FAILURE_MSG);
+    }
+  }
+
+
+  /**
+   * method to auto schedule the surgeries
+   *
+   * @param scheduleSetup - scheduleSetup
+   * @return AutoSchedulerSummaryResponseDTO - autoScheduleResponse
+   */
+  // Method to schedule surgeries
+  private AutoSchedulerSummaryResponseDTO schedule(String scheduleId, ScheduleSetup scheduleSetup) {
+    LogUtils.info("Total surgeries to schedule: {} for the scheduleId: {}",
+        scheduleSetup.surgeries.size(), scheduleId);
+    AutoSchedulerSummaryResponseDTO summaryResponseDTO = new AutoSchedulerSummaryResponseDTO();
+
+    for (GraphQLSurgeryDTO surgery : scheduleSetup.surgeries) {
+      boolean scheduled = assignRoomAndTime(scheduleSetup, surgery, summaryResponseDTO);
+      if (scheduled) {
+        summaryResponseDTO.addScheduledSurgery(surgery);
+      }// else: Surgery has been added to failedToScheduleSurgeries in assignRoomAndTime
+    }
+    LogUtils.info("Assigning room and time completed for the scheduleId: {}", scheduleId);
+
+    return summaryResponseDTO;
+  }
+
+  /**
+   * method to assign room and time for surgeries
+   *
+   * @param scheduleSetup      - scheduleSetup
+   * @param surgery            - surgery
+   * @param summaryResponseDTO - summaryResponseDTO
+   * @return boolean
+   */
+  // Assign room and time to a surgery
+  private boolean assignRoomAndTime(ScheduleSetup scheduleSetup,
+      GraphQLSurgeryDTO surgery,
+      AutoSchedulerSummaryResponseDTO summaryResponseDTO) {
+
+    String surgeonId = surgery.getSurgeryData().getSurgeonId();
+
+    // to fetch duration from surgeon preference
+    SurgeonPreferenceDetailsDTO surgeonPref = scheduleSetup.surgeonPreferences.get(surgeonId);
+    int duration = scheduleSetup.getSurgeryDuration(surgery.getSurgeryData());
+
+    // Check if surgery requires ORA and if rooms have ORA
+    //get all room if surgery don't have ora otherwise get only ora rooms.
+    List<RoomListingDTO> suitableRooms = scheduleSetup.operationRooms.stream()
+        .filter(room -> !surgery.getSurgeryData().isOra() || room.isOra())
+        .toList();
+
+    if (suitableRooms.isEmpty()) {
+      // log that surgery has no ORARoom
+      summaryResponseDTO.addNoORA(surgery);
+      return false;
+    }
+
+    // Check if surgery requires Femto
+    boolean requiresFemto = surgery.getSurgeryData().isLensx();
+
+    // if requiresFemto then check if suitableRooms has Femto equipment
+    List<RoomListingDTO> roomsWithFemto = suitableRooms.stream()
+        .filter(room -> requiresFemto && room.isFemto())
+        .toList();
+
+    // if roomsWithFemto is empty then check if procedureRoom has Femto equipment
+    if (requiresFemto && roomsWithFemto.isEmpty() && (scheduleSetup.procedureRoom == null
+        || !scheduleSetup.procedureRoom.isFemto())) {
+      // log that surgery has no FemtoRoom
+      summaryResponseDTO.addNoFemtoRoom(surgery);
+      return false;
+    }
+
+    // Get surgeon preference for additional Lensx time
+    int additionalLensxTimeMins = surgeonPref != null && surgeonPref.getAdditionalLenxTime() != null
+        ? surgeonPref.getAdditionalLenxTime()
+        : 10; // Default to 10 minutes if not specified
+
+    // Try to schedule in suitable rooms
+    for (RoomListingDTO room : suitableRooms) {
+      LocalTime currentStartTime = scheduleSetup.scheduleStartTime;
+
+      List<TimeSlot> roomSchedule = scheduleSetup.roomOccupiedSlots.getOrDefault(
+          room.getId().toString(), new ArrayList<>());
+      List<TimeSlot> surgeonSchedule = scheduleSetup.surgeonOccupiedSlots.getOrDefault(surgeonId,
+          new ArrayList<>());
+
+      // Adjust duration and start times if Femto is required and room doesn't have Femto
+      int adjustedDuration = duration; // surgeon preference duration
+      LocalTime surgeryStartTime = currentStartTime;
+
+      if (requiresFemto && !room.isFemto() && scheduleSetup.procedureRoom != null
+          && scheduleSetup.procedureRoom.isFemto()) {
+        // Adjust surgery duration and start time
+        adjustedDuration = Math.max(10, duration
+            - additionalLensxTimeMins);  // after deducting femto time from actual duration if the op room duration is less than 10 make it as 10.
+        surgeryStartTime = currentStartTime.plusMinutes(
+            additionalLensxTimeMins);  // start time in Op room.
+      }
+
+      // while surgery end time is before end of day
+      // end time is end of day - at least get this from a global configuration
+      // surgeryStartTime.plusMinutes(adjustedDuration) to calculate surgery end time in op room.
+      while (surgeryStartTime.plusMinutes(adjustedDuration)
+          .isBefore(SchedulerServiceConstants.END_OF_WORKING_DAY) &&
+          surgeryStartTime.plusMinutes(adjustedDuration).isAfter(surgeryStartTime)) {
+
+        LocalTime surgeryEndTime = surgeryStartTime.plusMinutes(adjustedDuration);
+
+        TimeSlot surgerySlot = new TimeSlot(surgeryStartTime, surgeryEndTime);
+
+        boolean overlaps = false;
+        LocalTime nextAvailableTime = surgeryStartTime;
+
+        // Check for overlaps in room schedule
+        for (TimeSlot slot : roomSchedule) {
+          if (surgerySlot.overlapsWith(slot)) {
+            overlaps = true;
+            nextAvailableTime = slot.end;
+            break;
+          }
+        }
+
+        if (overlaps) {
+          surgeryStartTime = nextAvailableTime;
+          continue;
+        }
+
+        // Check for overlaps in surgeon schedule
+        for (TimeSlot slot : surgeonSchedule) {
+          if (surgerySlot.overlapsWith(slot)) {
+            overlaps = true;
+            nextAvailableTime = slot.end;
+            break;
+          }
+        }
+
+        if (overlaps) {
+          surgeryStartTime = nextAvailableTime;
+          continue;
+        }
+
+        // Check for overlaps with breaks
+        for (TimeSlot breakSlot : scheduleSetup.surgeonBreaks) {
+          if (surgerySlot.overlapsWith(breakSlot)) {
+            overlaps = true;
+            nextAvailableTime = breakSlot.end;
+            break;
+          }
+        }
+
+        if (overlaps) {
+          surgeryStartTime = nextAvailableTime;
+          continue;
+        }
+
+        // checking overlap with shadow cards
+        for (TimeSlot shadowSlot : scheduleSetup.shadowCardDTOList) {
+          if (surgerySlot.overlapsWith(shadowSlot)) {
+            overlaps = true;
+            nextAvailableTime = shadowSlot.end;
+            break;
+          }
+        }
+
+        if (overlaps) {
+          surgeryStartTime = nextAvailableTime;
+          continue;
+        }
+
+        // If Femto is required and room has Femto equipment
+        if (requiresFemto && room.isFemto()) {
+          // Ensure operationRoom is initialized
+          if (surgery.getSurgeryData().getOperationRoom() == null) {
+            surgery.getSurgeryData().setOperationRoom(new OperationRoom());
+          }
+
+          // Assign roomId and startTime
+          surgery.getSurgeryData().getOperationRoom().setRoomId(String.valueOf(room.getId()));
+          surgery.getSurgeryData().getOperationRoom()
+              .setStartTime(formatSSTime(scheduleSetup, surgeryStartTime));
+          surgery.getSurgeryData().getOperationRoom().setPlannedDuration(duration);
+
+          // Update schedules
+          roomSchedule.add(surgerySlot);
+          surgeonSchedule.add(surgerySlot);
+
+          scheduleSetup.roomOccupiedSlots.put(room.getId().toString(), roomSchedule);
+          scheduleSetup.surgeonOccupiedSlots.put(surgeonId, surgeonSchedule);
+
+          return true;
+        }
+
+        // If Femto is required and room doesn't have Femto but Procedure Room is available
+        if (requiresFemto && scheduleSetup.procedureRoom != null
+            && scheduleSetup.procedureRoom.isFemto()) {
+          // Femto procedure in procedure room
+          LocalTime femtoStartTime = surgeryStartTime.minusMinutes(additionalLensxTimeMins);
+          TimeSlot femtoSlot = new TimeSlot(femtoStartTime, surgeryStartTime);
+
+          // Create combined slot from femtoStartTime to surgeryEndTime
+          TimeSlot combinedSlot = new TimeSlot(femtoStartTime, surgeryEndTime);
+
+          // Check for overlaps in surgeon schedule for femtoSlot and surgerySlot
+          for (TimeSlot slot : surgeonSchedule) {
+            if (combinedSlot.overlapsWith(slot)) {
+              overlaps = true;
+              // nextAvailableTime for surgery should be after femto slot
+              // hence adding femtoTime to end of surgeon's current slot
+              nextAvailableTime = slot.end.plusMinutes(additionalLensxTimeMins);
+              break;
+            }
+          }
+
+          if (overlaps) {
+            surgeryStartTime = nextAvailableTime;
+            continue;
+          }
+
+          // Check for overlaps with breaks in combined slot
+          for (TimeSlot breakSlot : scheduleSetup.surgeonBreaks) {
+            if (combinedSlot.overlapsWith(breakSlot)) {
+              overlaps = true;
+              // nextAvailableTime for surgery should be after femto slot
+              // hence adding femtoTime to end of surgeon's break slot
+              nextAvailableTime = breakSlot.end.plusMinutes(additionalLensxTimeMins);
+              break;
+            }
+          }
+
+          if (overlaps) {
+            surgeryStartTime = nextAvailableTime;
+            continue;
+          }
+
+          // Ensure operationRoom and procedureRoom are initialized
+          if (surgery.getSurgeryData().getOperationRoom() == null) {
+            surgery.getSurgeryData().setOperationRoom(new OperationRoom());
+          }
+          if (surgery.getSurgeryData().getProcedureRoom() == null) {
+            surgery.getSurgeryData().setProcedureRoom(new ProcedureRoom());
+          }
+
+          // Assign roomId and startTime for operationRoom
+          surgery.getSurgeryData().getOperationRoom().setRoomId(room.getId().toString());
+          surgery.getSurgeryData().getOperationRoom()
+              .setStartTime(formatSSTime(scheduleSetup, surgeryStartTime));
+          surgery.getSurgeryData().getOperationRoom().setPlannedDuration(adjustedDuration);
+
+          // Assign roomId and startTime for procedureRoom
+          surgery.getSurgeryData().getProcedureRoom()
+              .setRoomId(scheduleSetup.procedureRoom.getId().toString());
+          surgery.getSurgeryData().getProcedureRoom()
+              .setStartTime(formatSSTime(scheduleSetup, femtoStartTime));
+          surgery.getSurgeryData().getProcedureRoom().setPlannedDuration(additionalLensxTimeMins);
+
+          // Update surgeon schedule
+          surgeonSchedule.add(femtoSlot);
+          surgeonSchedule.add(surgerySlot);
+          scheduleSetup.surgeonOccupiedSlots.put(surgeonId, surgeonSchedule);
+
+          // Update room schedule for operation room
+          roomSchedule.add(surgerySlot);
+          scheduleSetup.roomOccupiedSlots.put(room.getId().toString(), roomSchedule);
+
+          // No need to update procedure room schedule since overlaps are allowed
+
+          return true;
+        }
+
+        // If no Femto required
+        if (!requiresFemto) {
+          // Ensure operationRoom is initialized
+          if (surgery.getSurgeryData().getOperationRoom() == null) {
+            surgery.getSurgeryData().setOperationRoom(new OperationRoom());
+          }
+
+          // Assign roomId and startTime
+          surgery.getSurgeryData().getOperationRoom().setRoomId(room.getId().toString());
+          surgery.getSurgeryData().getOperationRoom()
+              .setStartTime(formatSSTime(scheduleSetup, surgeryStartTime));
+          surgery.getSurgeryData().getOperationRoom().setPlannedDuration(duration);
+
+          // Update schedules
+          roomSchedule.add(surgerySlot);
+          surgeonSchedule.add(surgerySlot);
+
+          scheduleSetup.roomOccupiedSlots.put(room.getId().toString(), roomSchedule);
+          scheduleSetup.surgeonOccupiedSlots.put(surgeonId, surgeonSchedule);
+
+          return true;
+        }
+
+        // If none of the above, move to next available time. This line is only here to avoid infinite
+        // loop in case surgeryStartTime is not updated by any of the above conditions
+        surgeryStartTime = surgeryStartTime.plusMinutes(1);
+      }
+    }
+
+    // If we reach here, no available time slots
+    summaryResponseDTO.addNoTimeSlot(surgery);
+    return false;
+  }
+
+
+  /**
+   * method to format SS time
+   *
+   * @param scheduleSetup    - scheduleSetup
+   * @param surgeryStartTime - surgeryStartTime
+   * @return String
+   */
+  private String formatSSTime(ScheduleSetup scheduleSetup, LocalTime surgeryStartTime) {
+    LocalDateTime startDateTime = LocalDateTime.of(scheduleSetup.scheduleDate, surgeryStartTime);
+    return DateUtil.localDateTimeToString(startDateTime, SS_DATE_PATTERN);
+  }
+
+  /**
+   * method to fetch the surgery to be scheduled.
+   *
+   * @param surgeonId     - current surgeonId
+   * @param surgeriesList - surgeriesList
+   * @param override      - override
+   * @return List<GraphQLSurgeryDTO> - list of surgeries to be scheduled.
+   */
+  private List<GraphQLSurgeryDTO> surgeryToBeScheduled(String surgeonId,
+      List<GraphQLSurgeryDTO> surgeriesList,
+      boolean override) {
+    // Get the current surgeon's surgeries
+    List<GraphQLSurgeryDTO> surgeryToBeScheduled = surgeriesList.stream()
+        .filter(s -> surgeonId.equals(s.getSurgeryData().getSurgeonId())).toList();
+    // if override false. exclude the surgery with operation room assigned(surgeries already scheduled for the surgeon)
+    // for the given surgeon. include only the operation room id null as input to algorithm
+    // for the given date for the given surgeon the unscheduled surgeries will be auto scheduled.
+    if (!override) {
+      surgeryToBeScheduled = surgeryToBeScheduled.stream()
+          .filter(s -> s.getSurgeryData().getOperationRoom() == null || Strings.isNullOrEmpty(
+              s.getSurgeryData().getOperationRoom().getRoomId()))
+          .toList();
+
+      // changes for SCHED-916
+      // If override is false, all surgeries with operationRoom with startTime assigned and no roomId should be ignored by algorithm
+      surgeryToBeScheduled = surgeryToBeScheduled.stream()
+          .filter(s -> s.getSurgeryData().getOperationRoom() == null
+              || s.getSurgeryData().getOperationRoom().getStartTime() == null).toList();
+    }
+    return surgeryToBeScheduled;
+  }
+
+
+  /**
+   * method to fetch the user scheduled surgeries.
+   *
+   * @param surgeonId     - surgeonId
+   * @param surgeriesList - surgeriesList
+   * @return List<GraphQLSurgeryDTO> - list of surgeries to be scheduled.
+   */
+  private List<GraphQLSurgeryDTO> userScheduledSurgeries(String surgeonId,
+      List<GraphQLSurgeryDTO> surgeriesList
+  ) {
+    // Get the current surgeon's surgeries
+    List<GraphQLSurgeryDTO> surgeryToBeScheduled = surgeriesList.stream()
+        .filter(s -> surgeonId.equals(s.getSurgeryData().getSurgeonId())).toList();
+    // returns the already or user scheduled surgeries for the current surgeon
+    // the surgery is considered to be user scheduled when roomid is not empty  or start time is not empty
+    return filterScheduledSurgeries(surgeryToBeScheduled);
+  }
+
+  /**
+   * method to filter the scheduled surgeries.
+   *
+   * @param surgeriesList - surgeriesList
+   * @return List<GraphQLSurgeryDTO> - returns scheduled surgeries.
+   */
+  private List<GraphQLSurgeryDTO> filterScheduledSurgeries(List<GraphQLSurgeryDTO> surgeriesList) {
+
+    // changes for SCHED-916
+    return surgeriesList.stream()
+        .filter(s -> ((s.getSurgeryData().getOperationRoom() != null && !Strings.isNullOrEmpty(
+            s.getSurgeryData().getOperationRoom().getRoomId()))
+            || (s.getSurgeryData().getOperationRoom() != null && !Strings.isNullOrEmpty(
+            s.getSurgeryData().getOperationRoom().getStartTime()))
+        ))
+        .toList();
+  }
+
+  /**
+   * method to fetch the room wise occupied slots.
+   *
+   * @param surgeryOccupiedSlots - surgeryOccupiedSlots
+   * @return Map<String, List < TimeSlot>> - return the list of occupied slot for each room
+   */
+  private Map<String, List<TimeSlot>> roomOccupiedSlots(
+      List<GraphQLSurgeryDTO> surgeryOccupiedSlots) {
+    List<OperationRoom> operationRoomsOccupiedSlots = surgeryOccupiedSlots.stream()
+        .map(e -> e.getSurgeryData().getOperationRoom()).toList();
+    //construct Map<RoomId, List<OperationRoom>>
+    Map<String, List<OperationRoom>> operationRoomsOccupiedSlotsMap = operationRoomsOccupiedSlots.stream()
+        .collect(groupingBy(OperationRoom::getRoomId));
+    // Convert occupied slots data to roomOccupiedSlots map
+    Map<String, List<TimeSlot>> roomOccupiedSlots = new HashMap<>();
+    for (Entry<String, List<OperationRoom>> entry : operationRoomsOccupiedSlotsMap.entrySet()) {
+      String roomId = entry.getKey();
+      List<OperationRoom> slots = entry.getValue();
+      List<TimeSlot> timeSlots = createSlots(slots);
+      roomOccupiedSlots.put(roomId, timeSlots);
+    }
+    return roomOccupiedSlots;
+  }
+
+  /**
+   * method to convert list of operation room to list of time slots using start time and duration.
+   *
+   * @param slots - list of operation room slots
+   * @return List<TimeSlot> - return list of time slots.
+   */
+  private List<TimeSlot> createSlots(List<OperationRoom> slots) {
+    //convert operationRoom list to time slot list.
+    List<TimeSlot> timeSlots = new ArrayList<>();
+    for (OperationRoom slotData : slots) {
+      LocalTime start = DateUtil.stringToLocalTime(slotData.getStartTime(), SS_DATE_PATTERN);
+      int duration = slotData.getPlannedDuration();
+      LocalTime end = start.plusMinutes(duration);
+      timeSlots.add(new TimeSlot(start, end));
+    }
+    return timeSlots;
+  }
+
+  /**
+   * method to get surgery occupied slots
+   *
+   * @param surgeonId - surgeonId
+   * @return List<GraphQLSurgeryDTO> - list of surgeries.
+   */
+  private List<GraphQLSurgeryDTO> getOccupiedSurgerySlots(
+      String surgeonId, List<GraphQLSurgeryDTO> surgeriesList, boolean override) {
+
+    //filter occupied slots including current surgeons + other surgeons.
+    List<GraphQLSurgeryDTO> surgeryOccupiedSlots = surgeriesList.stream()
+        .filter(s -> s.getSurgeryData().getOperationRoom() != null && !Strings.isNullOrEmpty(
+            s.getSurgeryData().getOperationRoom().getRoomId())).toList();
+
+    if (override) {
+      // if override true. schedule all the surgery in the current surgeon list. In occupied slots remove the current surgeon slot so that
+      // all surgery for that surgeon needs to be rescheduled.
+      surgeryOccupiedSlots = surgeryOccupiedSlots.stream()
+          .filter(s -> !surgeonId.equals(s.getSurgeryData().getSurgeonId())).toList();
+    }
+    return surgeryOccupiedSlots;
+  }
+
+  /**
+   * method to get surgeon wise occupied slots
+   *
+   * @param surgeryOccupiedSlots - surgeryOccupiedSlots
+   * @return Map<String, List < TimeSlot>> - return list of occupied timeslot for each surgeon.
+   */
+  private Map<String, List<TimeSlot>> surgeonOccupiedSlots(
+      List<GraphQLSurgeryDTO> surgeryOccupiedSlots) {
+    Map<String, List<OperationRoom>> surgeriesBySurgeonId = surgeryOccupiedSlots.stream()
+        .collect(groupingBy(e -> e.getSurgeryData().getSurgeonId(),
+            mapping(e -> e.getSurgeryData().getOperationRoom(), Collectors.toList())));
+    //construct Map<SurgeonId, List<TimeSlot> to keep the slot already assigned to the surgeon.
+    Map<String, List<TimeSlot>> surgeonOccupiedSlots = new HashMap<>();
+    surgeriesBySurgeonId.forEach((surgeon, slots) -> {
+      List<TimeSlot> timeSlots = createSlots(slots);
+      surgeonOccupiedSlots.put(surgeon, timeSlots);
+    });
+    return surgeonOccupiedSlots;
+  }
+
+
+  private Map<String, List<TimeSlot>> otherSurgeonOccupiedSlotsByRoom(String surgeonId,
+      List<GraphQLSurgeryDTO> surgeryOccupiedSlots) {
+    if (!CollectionUtils.isEmpty(surgeryOccupiedSlots)) {
+      Map<String, List<OperationRoom>> otherSurgeonSurgeriesByRoom = surgeryOccupiedSlots.stream()
+          .filter(e -> !e.getSurgeryData().getSurgeonId().equals(surgeonId))
+          .collect(groupingBy(e -> e.getSurgeryData().getOperationRoom().getRoomId(),
+              mapping(e -> e.getSurgeryData().getOperationRoom(), Collectors.toList())));
+      //construct Map<SurgeonId, List<TimeSlot> to keep the slot already assigned to the surgeon.
+      if (!otherSurgeonSurgeriesByRoom.isEmpty()) {
+        Map<String, List<TimeSlot>> otherSurgeonOccupiedSlotByRoom = new HashMap<>();
+        otherSurgeonSurgeriesByRoom.forEach((roomId, rooms) -> {
+          List<TimeSlot> timeSlots = createSlots(rooms);
+          otherSurgeonOccupiedSlotByRoom.put(roomId, timeSlots);
+        });
+        return otherSurgeonOccupiedSlotByRoom;
+      }
+    }
+    return Collections.emptyMap();
+  }
+
+  /**
+   * Check if provided rooms exists in the database.
+   *
+   * @param scheduleSetup    - scheduleSetup - save in schedule setup
+   * @param operationRoomIds - operationRoomIds
+   * @param procedureRoomId  - procedureRoomId
+   */
+  private void checkRooms(ScheduleSetup scheduleSetup, List<String> operationRoomIds,
+      String procedureRoomId) {
+    // convert operation room list of roomId to objects
+    if (!CollectionUtils.isEmpty(operationRoomIds)) {
+      List<UUID> operationRoomsUUID = operationRoomIds.stream().map(UUID::fromString).toList();
+      LogUtils.info("Fetching Operation Room details from db");
+      List<Room> operationRoom = roomRepository.findAllById(operationRoomsUUID);
+      scheduleSetup.operationRooms = roomMapper.toDTOs(operationRoom);
+    }
+
+    // fetching the procedure room object using procedure room id.
+    if (!Strings.isNullOrEmpty(procedureRoomId)) {
+      LogUtils.info("Fetching Procedure Room details from db for id: {}", procedureRoomId);
+      Optional<Room> procedureRoom = roomRepository.findById(UUID.fromString(procedureRoomId));
+      if (procedureRoom.isPresent()) {
+        scheduleSetup.procedureRoom = roomMapper.convertEntityToDto(procedureRoom.get());
+      } else {
+        throw new MCCServiceException(HttpStatus.NOT_FOUND, "Room not found: " + procedureRoomId);
+      }
+    }
+  }
+
+  /**
+   * Apply changes
+   *
+   * @param response     - response already generated by algorithm if passed response is null, it
+   *                     will check cache
+   * @param applyChanges - save changes in SS even if there is failed surgeries to be assigned to
+   *                     room
+   * @return boolean - if changes saved in SS
+   */
+  private @Nullable AutoSchedulerSummaryResponseDTO applyChanges(
+      AutoSchedulerSummaryResponseDTO response,
+      boolean applyChanges,
+      Schedule schedule,
+      ScheduleSetup scheduleSetup,
+      boolean override) throws JsonProcessingException {
+    Cache cache = cacheManager.getCache(AUTOSCHEDULE_RESPONSE_CACHE_NAME);
+    if (cache != null) {
+      if (response == null) { // If response is null, check cache
+        response = cache.get(schedule.getId().toString(), AutoSchedulerSummaryResponseDTO.class);
+      } else if (response.totalFailed()
+          > 0) { // Save response in cache if there is failed surgeries
+        cache.put(schedule.getId().toString(), response);
+      }
+    }
+
+    boolean hasResponse = response != null;
+    boolean hasFailedSurgeries = response != null && response.totalFailed() > 0;
+    // Save response in SS if response is not null and has no failed surgeries or
+    // response is not null and applyChanges is true
+    if ((hasResponse && !hasFailedSurgeries) || (hasResponse && applyChanges)) {
+      if (CollectionUtils.isNotEmpty(response.getScheduledSurgeries())) {
+        if (response.getScheduledSurgeries().size() > 60) {
+          throw new MCCServiceException(HttpStatus.EXPECTATION_FAILED,
+              "Scheduler results cannot be saved in Smart Solutions, as count of surgeries is greater than "
+                  + 60);
+        }
+        AutoSchedulerSurgeryUpdateResponseDTO surgeryUpdateResponse = updateSurgeriesInSmartSolution(
+            response.getScheduledSurgeries(), response.getFailedToScheduleSurgeries(), override);
+        if (CollectionUtils.isNotEmpty(surgeryUpdateResponse.getFailedSurgeries())) {
+          response.setFailedSurgeriesInSS(
+              surgeryUpdateResponse.getFailedSurgeries());
+        }
+        if (CollectionUtils.isNotEmpty(surgeryUpdateResponse.getSuccessfulSurgeries())) {
+          Set<String> successfulSurgeriesToSet = new HashSet<>(
+              surgeryUpdateResponse.getSuccessfulSurgeries());
+          response.setSuccessfulSurgeriesInSS(successfulSurgeriesToSet);
+        }
+      }
+      updateRoomsInView(schedule, scheduleSetup);
+      LogUtils.info("Scheduling process completed");
+      LogUtils.info("Total surgeries failed to schedule: {}", response.totalFailed());
+      LogUtils.info("Successfully scheduled surgeries: {} ",
+          response.getScheduledSurgeries().size());
+    }
+    return response;
+  }
+
+  private void updateRoomsInView(Schedule schedule, ScheduleSetup scheduleSetup)
+      throws JsonProcessingException {
+
+    Set<String> roomInViewToUpdate = new HashSet<>();
+    Map<String, Set<String>> roomInViewGroupByType = new HashMap<>();
+    if (schedule.getRoomsInView() != null) {
+      List<UUID> roomsIds = schedulerUtils.convertJsonbToList(schedule.getRoomsInView()).stream()
+          .map(UUID::fromString).toList();
+      List<Room> roomInViewList = roomRepository.findByIdIn(roomsIds);
+
+      roomInViewGroupByType = roomInViewList.stream().collect(
+          groupingBy(e -> e.getRoomType().getRoomTypeName(),
+              mapping(e -> e.getId().toString(), toSet())));
+    }
+    // To update RoomInView in schedule table
+    Set<String> roomInViewORs = roomInViewGroupByType.get(RoomType.OPERATING_ROOM.name());
+
+    if (CollectionUtils.isNotEmpty(roomInViewORs)) {
+      roomInViewToUpdate.addAll(roomInViewORs);
+    }
+    if (CollectionUtils.isNotEmpty(scheduleSetup.getOperationRoomIds())) {
+      roomInViewToUpdate.addAll(scheduleSetup.getOperationRoomIds());
+    }
+
+    // To update RoomInView in schedule table
+    Set<String> roomInViewPRs = roomInViewGroupByType.get(RoomType.PROCEDURE_ROOM.name());
+    // if the procedure room is empty in payload. keep the schedule table roomInView.
+    if (scheduleSetup.procedureRoom == null && CollectionUtils.isNotEmpty(roomInViewPRs)) {
+      roomInViewToUpdate.addAll(roomInViewPRs);
+    } else if (scheduleSetup.procedureRoom != null) {
+      // if the procedure room is not empty in payload.
+      // 1. replace the procedure room id in schedule table roomInView if present.
+      // 2. add the procedure room id in schedule table roomInView if not present.
+      roomInViewToUpdate.add(scheduleSetup.procedureRoom.getId().toString());
+    }
+    // remove null or empty values.
+    roomInViewToUpdate = roomInViewToUpdate.stream().filter(e -> !Strings.isNullOrEmpty(e)).collect(
+        Collectors.toSet());
+    ObjectMapper objectMapper = new ObjectMapper();
+    schedule.setRoomsInView(objectMapper.writeValueAsString(roomInViewToUpdate));
+    LogUtils.info("Updating schedule table roomInView for the scheduleId: {}", schedule.getId());
+    scheduleRepository.save(schedule);
+    LogUtils.info("Update complete for schedule table roomInView for the scheduleId: {}",
+        schedule.getId());
+  }
+
+  private void fetchShadowCards(String scheduleId, ScheduleSetup scheduleSetup) {
+    List<ScheduleShadowCardDTO> shadowCardDTOList = scheduleShadowService.getScheduleShadow(
+        scheduleId);
+    shadowCardDTOList.forEach(e -> {
+      com.alcon.acemcc.model.OperationRoom operationRoom = e.getOperationRoom();
+      if (operationRoom != null && operationRoom.getStartTime() != null) {
+        String surgeryStartTimeValue = operationRoom.getStartTime();
+        LocalTime surgeryStartTime = DateUtil.stringToLocalTime(surgeryStartTimeValue,
+            SS_DATE_PATTERN);
+        LocalTime surgeryEndTime = surgeryStartTime.plusMinutes(
+            operationRoom.getPlannedDuration());
+        scheduleSetup.shadowCardDTOList.add(new TimeSlot(surgeryStartTime, surgeryEndTime));
+      }
+    });
+  }
+}
